@@ -16,7 +16,7 @@ public class FreezeverticalRotationSystem : SystemBase
              .ForEach((ref PhysicsMass mass) =>
              {
                  mass.InverseInertia[0] = 0;
-                 mass.InverseInertia[1] = 0;
+                //  mass.InverseInertia[1] = 0;
                  mass.InverseInertia[2] = 0;
 
              }).Schedule();
