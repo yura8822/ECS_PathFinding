@@ -8,35 +8,161 @@ using Unity.Burst;
 using Unity.Entities;
 using Unity.Collections.LowLevel.Unsafe;
 
-public class PathFinding : ComponentSystem
+public class PathFinding : SystemBase
 {
     private const int MOVE_STRAIGHT_COST = 10;
     private const int MOVE_DIAGONAL_COST = 14;
 
+    EndSimulationEntityCommandBufferSystem m_EndSimulationEcbSystem;
+    protected override void OnCreate()
+    {
+        base.OnCreate();
+        m_EndSimulationEcbSystem = World
+               .GetOrCreateSystem<EndSimulationEntityCommandBufferSystem>();
+    }
+
     protected override void OnUpdate()
     {
+        EntityCommandBuffer ecb = m_EndSimulationEcbSystem.CreateCommandBuffer();
+
         int width = PathFindingGridSetup.INSTANCE.pathFindingGrid.getWidth();
         int height = PathFindingGridSetup.INSTANCE.pathFindingGrid.getHeight();
         int2 gridSize = new int2(width, height);
 
-        NativeList<JobHandle> jobHandleList = new NativeList<JobHandle>(Allocator.Temp);
-        Entities.ForEach((Entity entity, DynamicBuffer<PathPositionBuffer> pathPositionBuffer, ref PathFindingParams pathFindingParams) =>
-                {
-                    FindPathJob findPathJob = new FindPathJob
-                    {
-                        pathNodeArray = getPathNodeArray(),
-                        startPosition = pathFindingParams.startPosition,
-                        endPosition = pathFindingParams.endPosition,
-                        entity = entity,
-                        pathFollowComponentFromEntity = GetComponentDataFromEntity<PathFollowData>(),
-                        gridSize = gridSize,
-                        pathPositionBuffer = pathPositionBuffer
-                    };
-                    jobHandleList.Add(findPathJob.Schedule());
-                    PostUpdateCommands.RemoveComponent<PathFindingParams>(entity);
-                });
-                JobHandle.CompleteAll(jobHandleList);
+        NativeArray<PathNode> originPathNodesArray = getPathNodeArray();
+
+        Entities
+       .WithName("PathFinding")
+       .WithDisposeOnCompletion(originPathNodesArray)
+       .ForEach((Entity entity, DynamicBuffer<PathPositionBuffer> pathPositionBuffer, ref PathFollowData pathFollowData, in PathFindingParams pathFindingParams) =>
+               {
+                   NativeArray<PathNode> pathNodeArray = new NativeArray<PathNode>(originPathNodesArray.Length, Allocator.Temp);
+                   pathNodeArray.CopyFrom(originPathNodesArray);
+
+                   int2 startPosition = pathFindingParams.startPosition;
+                   int2 endPosition = pathFindingParams.endPosition;
+
+                   for (int i = 0; i < pathNodeArray.Length; i++)
+                   {
+                       PathNode pathNode = pathNodeArray[i];
+                       pathNode.hCost = calculateDistanceCost(new int2(pathNode.x, pathNode.y), endPosition);
+                       pathNode.cameFromNodeIndex = -1;
+                       pathNodeArray[i] = pathNode;
+                   }
+                   NativeArray<int2> neighbourOffsetArray = new NativeArray<int2>(8, Allocator.Temp);
+                   neighbourOffsetArray[0] = new int2(-1, 0); //left
+                   neighbourOffsetArray[1] = new int2(+1, 0); //right
+                   neighbourOffsetArray[2] = new int2(0, +1); //up
+                   neighbourOffsetArray[3] = new int2(0, -1); //down
+                   neighbourOffsetArray[4] = new int2(-1, -1); //left down
+                   neighbourOffsetArray[5] = new int2(-1, +1); //left up
+                   neighbourOffsetArray[6] = new int2(+1, -1); //right down
+                   neighbourOffsetArray[7] = new int2(+1, +1); //right up
+
+                   int endNodeIndex = calculateIndex(endPosition.x, endPosition.y, gridSize.x);
+
+                   PathNode startNode = pathNodeArray[calculateIndex(startPosition.x, startPosition.y, gridSize.x)];
+                   startNode.gCost = 0;
+                   startNode.calculateFCost();
+                   pathNodeArray[startNode.index] = startNode;
+
+                   NativeList<int> openList = new NativeList<int>(Allocator.Temp);
+                   NativeList<int> closedList = new NativeList<int>(Allocator.Temp);
+
+                   openList.Add(startNode.index);
+
+                   while (openList.Length > 0)
+                   {
+                       int currentNodeIndex = getLowestCoatFNodeIndex(openList, pathNodeArray);
+                       PathNode currentNode = pathNodeArray[currentNodeIndex];
+
+                       if (currentNodeIndex == endNodeIndex)
+                       {  //цель достигнута
+                           break;
+                       }
+
+                       for (int i = 0; i < openList.Length; i++)
+                       {
+                           if (openList[i] == currentNodeIndex)
+                           {
+                               //текущий узел проверен, удаляем его из openList
+                               openList.RemoveAtSwapBack(i);
+                               break;
+                           }
+                       }
+
+                       //и добовляем к проверенным в closedList
+                       closedList.Add(currentNodeIndex);
+
+                       for (int i = 0; i < neighbourOffsetArray.Length; i++)
+                       {
+                           int2 neighbourOffset = neighbourOffsetArray[i];
+                           int2 neighbourPosition = new int2(currentNode.x + neighbourOffset.x, currentNode.y + neighbourOffset.y);
+
+                           if (!isPositionInsideGrid(neighbourPosition, gridSize))
+                           {
+                               //соседняя позиция находится за пределами сетки
+                               continue;
+                           }
+
+                           int neighbourNodeIndex = calculateIndex(neighbourPosition.x, neighbourPosition.y, gridSize.x);
+
+                           if (closedList.Contains(neighbourNodeIndex))
+                           {
+                               //текущий узел уже проверен и находится в закрытом списке
+                               continue;
+                           }
+
+                           PathNode neighbourNode = pathNodeArray[neighbourNodeIndex];
+                           if (!neighbourNode.isWalkable)
+                           {
+                               // узел является препятствием
+                               continue;
+                           }
+
+                           int2 currentNodePosition = new int2(currentNode.x, currentNode.y);
+
+                           int tentativeGCost = currentNode.gCost + calculateDistanceCost(currentNodePosition, neighbourPosition);
+                           if (tentativeGCost < neighbourNode.gCost)
+                           {
+                               neighbourNode.cameFromNodeIndex = currentNodeIndex;
+                               neighbourNode.gCost = tentativeGCost;
+                               neighbourNode.calculateFCost();
+                               pathNodeArray[neighbourNodeIndex] = neighbourNode;
+
+                               if (!openList.Contains(neighbourNode.index))
+                               {
+                                   openList.Add(neighbourNode.index);
+                               }
+                           }
+                       }
+                   }
+
+                   pathPositionBuffer.Clear();
+                   PathNode endNode = pathNodeArray[endNodeIndex];
+                   if (endNode.cameFromNodeIndex == -1)
+                   {
+                       //путь не найден
+                       pathFollowData.pathIndex = -1;
+                   }
+                   else
+                   {
+                       //путь найден
+                       calculatePath(pathNodeArray, endNode, pathPositionBuffer);
+                       pathFollowData.pathIndex = pathPositionBuffer.Length - 1;
+                   }
+
+                   pathNodeArray.Dispose();
+                   neighbourOffsetArray.Dispose();
+                   openList.Dispose();
+                   closedList.Dispose();
+
+                   ecb.RemoveComponent<PathFindingParams>(entity);
+               }).Schedule();
+
+        m_EndSimulationEcbSystem.AddJobHandleForProducer(this.Dependency);
     }
+   
     private NativeArray<PathNode> getPathNodeArray()
     {
         _Grid<GridNode> grid = PathFindingGridSetup.INSTANCE.pathFindingGrid;
@@ -62,137 +188,6 @@ public class PathFinding : ComponentSystem
             }
         }
         return pathNodeArray;
-    }
-
-    [BurstCompile]
-    private struct FindPathJob : IJob
-    {
-        [DeallocateOnJobCompletion] public NativeArray<PathNode> pathNodeArray; //Allocator.TempJob аналогично вызову pathNodeArray.Dispose();
-        public int2 startPosition;
-        public int2 endPosition;
-        public Entity entity;
-        [NativeDisableContainerSafetyRestriction]
-        public ComponentDataFromEntity<PathFollowData> pathFollowComponentFromEntity;
-        public int2 gridSize;
-        [NativeDisableContainerSafetyRestriction]
-        public DynamicBuffer<PathPositionBuffer> pathPositionBuffer;
-
-        public void Execute()
-        {
-            for (int i = 0; i < pathNodeArray.Length; i++)
-            {
-                PathNode pathNode = pathNodeArray[i];
-                pathNode.hCost = calculateDistanceCost(new int2(pathNode.x, pathNode.y), endPosition);
-                pathNode.cameFromNodeIndex = -1;
-                pathNodeArray[i] = pathNode;
-            }
-            NativeArray<int2> neighbourOffsetArray = new NativeArray<int2>(8, Allocator.Temp);
-            neighbourOffsetArray[0] = new int2(-1, 0); //left
-            neighbourOffsetArray[1] = new int2(+1, 0); //right
-            neighbourOffsetArray[2] = new int2(0, +1); //up
-            neighbourOffsetArray[3] = new int2(0, -1); //down
-            neighbourOffsetArray[4] = new int2(-1, -1); //left down
-            neighbourOffsetArray[5] = new int2(-1, +1); //left up
-            neighbourOffsetArray[6] = new int2(+1, -1); //right down
-            neighbourOffsetArray[7] = new int2(+1, +1); //right up
-
-            int endNodeIndex = calculateIndex(endPosition.x, endPosition.y, gridSize.x);
-
-            PathNode startNode = pathNodeArray[calculateIndex(startPosition.x, startPosition.y, gridSize.x)];
-            startNode.gCost = 0;
-            startNode.calculateFCost();
-            pathNodeArray[startNode.index] = startNode;
-
-            NativeList<int> openList = new NativeList<int>(Allocator.Temp);
-            NativeList<int> closedList = new NativeList<int>(Allocator.Temp);
-
-            openList.Add(startNode.index);
-
-            while (openList.Length > 0)
-            {
-                int currentNodeIndex = getLowestCoatFNodeIndex(openList, pathNodeArray);
-                PathNode currentNode = pathNodeArray[currentNodeIndex];
-
-                if (currentNodeIndex == endNodeIndex)
-                {  //цель достигнута
-                    break;
-                }
-
-                for (int i = 0; i < openList.Length; i++)
-                {
-                    if (openList[i] == currentNodeIndex)
-                    {
-                        //текущий узел проверен, удаляем его из openList
-                        openList.RemoveAtSwapBack(i);
-                        break;
-                    }
-                }
-
-                //и добовляем к проверенным в closedList
-                closedList.Add(currentNodeIndex);
-
-                for (int i = 0; i < neighbourOffsetArray.Length; i++)
-                {
-                    int2 neighbourOffset = neighbourOffsetArray[i];
-                    int2 neighbourPosition = new int2(currentNode.x + neighbourOffset.x, currentNode.y + neighbourOffset.y);
-
-                    if (!isPositionInsideGrid(neighbourPosition, gridSize))
-                    {
-                        //соседняя позиция находится за пределами сетки
-                        continue;
-                    }
-
-                    int neighbourNodeIndex = calculateIndex(neighbourPosition.x, neighbourPosition.y, gridSize.x);
-
-                    if (closedList.Contains(neighbourNodeIndex))
-                    {
-                        //текущий узел уже проверен и находится в закрытом списке
-                        continue;
-                    }
-
-                    PathNode neighbourNode = pathNodeArray[neighbourNodeIndex];
-                    if (!neighbourNode.isWalkable)
-                    {
-                        // узел является препятствием
-                        continue;
-                    }
-
-                    int2 currentNodePosition = new int2(currentNode.x, currentNode.y);
-
-                    int tentativeGCost = currentNode.gCost + calculateDistanceCost(currentNodePosition, neighbourPosition);
-                    if (tentativeGCost < neighbourNode.gCost)
-                    {
-                        neighbourNode.cameFromNodeIndex = currentNodeIndex;
-                        neighbourNode.gCost = tentativeGCost;
-                        neighbourNode.calculateFCost();
-                        pathNodeArray[neighbourNodeIndex] = neighbourNode;
-
-                        if (!openList.Contains(neighbourNode.index))
-                        {
-                            openList.Add(neighbourNode.index);
-                        }
-                    }
-                }
-            }
-
-            pathPositionBuffer.Clear();
-            PathNode endNode = pathNodeArray[endNodeIndex];
-            if (endNode.cameFromNodeIndex == -1)
-            {
-                //путь не найден
-                pathFollowComponentFromEntity[entity] = new PathFollowData { pathIndex = -1 };
-            }
-            else
-            {
-                //путь найден
-                calculatePath(pathNodeArray, endNode, pathPositionBuffer);
-                pathFollowComponentFromEntity[entity] = new PathFollowData { pathIndex = pathPositionBuffer.Length - 1 };
-            }
-
-            neighbourOffsetArray.Dispose();
-            openList.Dispose();
-            closedList.Dispose();
-        }
     }
 
     //Рассчитываем путивые точки и возвращаем NativeList(тестовый метод)
